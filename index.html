@@ -728,6 +728,29 @@
       '/contents/' + encodeURIComponent(c.path);
   }
 
+  // Verifica se o token enxerga o repositório em si (não o arquivo de dados).
+  // O GitHub responde 404 tanto pra "repositório não existe" quanto pra "token
+  // sem acesso a ele" (por design, pra não vazar existência de repos privados) —
+  // então isso sozinho não distingue os dois casos. Mas serve pra separar
+  // "sem acesso ao repositório" de "repositório OK, arquivo de dados ainda não
+  // existe" (que é normal no primeiro uso), dando uma mensagem de erro melhor
+  // no login em vez de deixar a tela parecer vazia sem explicação.
+  async function checkRepoAccess(){
+    var c = ghConfig();
+    var res;
+    try{
+      res = await fetch(GH_API + '/repos/' + encodeURIComponent(c.owner) + '/' + encodeURIComponent(c.repo), { headers: ghHeaders() });
+    }catch(e){
+      throw { type: 'network' };
+    }
+    if(res.status === 401 || res.status === 403 || res.status === 404){
+      throw { type: 'auth', status: res.status };
+    }
+    if(!res.ok){
+      throw { type: 'http', status: res.status };
+    }
+  }
+
   function setSyncStatus(kind, text){
     var el = document.getElementById('sync-status');
     if(!el) return;
@@ -848,16 +871,24 @@
       if(isDirty || syncInFlight || !navigator.onLine || document.hidden || !ghConfigured()) return;
       try{
         var remote = await fetchRemoteState(false);
+        if(!remote.accounts) remote.accounts = [];
+        if(!remote.transactions) remote.transactions = [];
+        if(!remote.payslips) remote.payslips = [];
         var remoteStr = JSON.stringify(remote);
         if(remoteStr !== JSON.stringify(state)){
-          state = remote;
-          if(!state.accounts) state.accounts = [];
-          if(!state.transactions) state.transactions = [];
-          if(!state.payslips) state.payslips = [];
-          try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){}
-          render();
-          lastSyncedAt = new Date();
-          setSyncStatus('synced', 'Atualizado de outro aparelho às ' + timeLabel(lastSyncedAt));
+          // Nunca deixa a checagem silenciosa em segundo plano encolher os dados
+          // locais (ex: se outro aparelho salvou um estado menor/vazio por engano).
+          // Só aplica automaticamente quando o remoto tem a mesma quantidade de
+          // itens ou mais; caso contrário ignora este ciclo e tenta de novo depois.
+          var localCount = (state.accounts||[]).length + (state.transactions||[]).length + (state.payslips||[]).length;
+          var remoteCount = remote.accounts.length + remote.transactions.length + remote.payslips.length;
+          if(remoteCount >= localCount){
+            state = remote;
+            try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){}
+            render();
+            lastSyncedAt = new Date();
+            setSyncStatus('synced', 'Atualizado de outro aparelho às ' + timeLabel(lastSyncedAt));
+          }
         }
       }catch(e){ /* silencioso: tenta de novo no próximo ciclo */ }
     }, 45000);
@@ -901,10 +932,38 @@
 
     try{
       var remote = await fetchRemoteState(true);
+      if(!remote.accounts) remote.accounts = [];
+      if(!remote.transactions) remote.transactions = [];
+      if(!remote.payslips) remote.payslips = [];
+
+      // Proteção contra perda de dados: se este aparelho tem mais itens salvos
+      // localmente do que o GitHub tem agora, é sinal de que uma sincronização
+      // anterior falhou (ex: token sem permissão) e os dados locais são mais
+      // recentes/completos do que os remotos. Nesse caso, em vez de sobrescrever
+      // silenciosamente, pergunta antes de decidir qual versão vale.
+      var localCount = (state.accounts||[]).length + (state.transactions||[]).length + (state.payslips||[]).length;
+      var remoteCount = remote.accounts.length + remote.transactions.length + remote.payslips.length;
+      if(localCount > remoteCount){
+        var manterLocal = confirm(
+          'Este aparelho tem ' + localCount + ' item(ns) salvos localmente, mas o GitHub tem apenas ' + remoteCount + '.\n\n' +
+          'Isso normalmente significa que a última sincronização deste aparelho falhou (ex: token sem permissão) e os dados daqui são os mais completos.\n\n' +
+          'Clique OK para MANTER os dados deste aparelho e enviá-los agora para o GitHub.\n' +
+          'Clique Cancelar para descartar os dados deste aparelho e usar os do GitHub.'
+        );
+        if(manterLocal){
+          // currentSha já foi atualizado por fetchRemoteState() acima, então o
+          // próximo envio (scheduleSync) vai sobrescrever o arquivo remoto correto.
+          render();
+          lastSyncedAt = null;
+          setSyncStatus('saving', 'Salvando…');
+          try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){}
+          scheduleSync();
+          startPolling();
+          return;
+        }
+      }
+
       state = remote;
-      if(!state.accounts) state.accounts = [];
-      if(!state.transactions) state.transactions = [];
-      if(!state.payslips) state.payslips = [];
       try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){}
       render();
       lastSyncedAt = new Date();
@@ -961,6 +1020,7 @@
     localStorage.setItem('financas-gh-config', JSON.stringify({ owner: owner, repo: repo, branch: branch, path: path }));
     localStorage.setItem('financas-gh-token', token);
     try{
+      await checkRepoAccess();
       await fetchRemoteState(false);
       btn.disabled = false;
       btn.textContent = 'Entrar e sincronizar';
