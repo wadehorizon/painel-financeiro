@@ -1523,13 +1523,20 @@
     var normDesc = normalizeDesc(tagNew ? tagNew.base : description);
     return state.transactions.find(function(t){
       if(t.accountId !== accountId) return false;
-      if(t.date !== date) return false;
       if(Math.abs(Math.abs(t.amount) - Math.abs(amount)) > 0.01) return false;
       var tagExisting = parseInstallmentTag(t.description);
       var tDesc = normalizeDesc(tagExisting ? tagExisting.base : t.description);
       if(tDesc !== normDesc) return false;
-      if(tagNew && tagExisting) return tagNew.current === tagExisting.current;
-      return true;
+      if(tagNew && tagExisting){
+        // Parcelas: identificadas pela posição (current/total), não pela data exata.
+        // A data real de cobrança de uma parcela costuma variar alguns dias de mês
+        // pra mês (fechamento de fatura, fim de semana, etc.), então exigir data
+        // idêntica fazia o app não reconhecer a parcela real importada depois como
+        // a mesma parcela já projetada automaticamente — e duplicava tudo em cascata.
+        return tagNew.current === tagExisting.current && tagNew.total === tagExisting.total;
+      }
+      // Lançamentos sem parcela: continuam exigindo a mesma data pra contar como duplicado.
+      return t.date === date;
     }) || null;
   }
 
