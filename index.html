@@ -697,6 +697,32 @@
   function catInfo(id){ return CATEGORIES.find(function(c){return c.id===id;}) || CATEGORIES[CATEGORIES.length-1]; }
   function acctInfo(id){ return state.accounts.find(function(a){return a.id===id;}); }
 
+  // Fatura de cartão fecha num ciclo que atravessa dois meses civis (ex: fatura que
+  // fecha 05/09 cobre compras de ~29/07 a 26/08) — agrupar lançamentos importados de
+  // fatura pela data da compra faz "Despesas do mês" nunca bater com o valor real da
+  // fatura. Por isso, ao importar um CSV de fatura, guardamos em invoiceMonth o mês da
+  // própria fatura (extraído do nome do arquivo, ex: "Nubank_20260905.csv" -> "2026-09"),
+  // e usamos esse campo pra agrupar em vez da data, quando ele existir.
+  function txMonthKey(t){
+    return t.invoiceMonth || (t.date ? t.date.slice(0,7) : '');
+  }
+  function parseInvoiceMonthFromFilename(name){
+    if(!name) return null;
+    var m = name.match(/(\d{4})(\d{2})(\d{2})/);
+    if(!m) return null;
+    var mo = parseInt(m[2],10), da = parseInt(m[3],10);
+    if(mo<1||mo>12||da<1||da>31) return null;
+    return m[1] + '-' + m[2];
+  }
+  function addMonthsToYYYYMM(ym, months){
+    var parts = ym.split('-');
+    var y = parseInt(parts[0],10), mo = parseInt(parts[1],10);
+    mo += months;
+    while(mo>12){ mo-=12; y++; }
+    while(mo<1){ mo+=12; y--; }
+    return y + '-' + String(mo).padStart(2,'0');
+  }
+
   function ghConfig(){
     try{ return JSON.parse(localStorage.getItem('financas-gh-config') || 'null'); }
     catch(e){ return null; }
@@ -1435,7 +1461,7 @@
     if(!file) return;
     Papa.parse(file, {
       header: true, skipEmptyLines: true,
-      complete: function(results){ handleCsvParsed(results); },
+      complete: function(results){ handleCsvParsed(results, file.name); },
       error: function(){ document.getElementById('csv-err').style.display='block'; }
     });
   });
@@ -1460,7 +1486,7 @@
     return round2(parseFloat(s));
   }
 
-  function handleCsvParsed(results){
+  function handleCsvParsed(results, fileName){
     var fields = results.meta.fields || [];
     var dateCol = guessColumn(fields, [/data/i, /date/i]);
     var descCol = guessColumn(fields, [/descri/i, /histor/i, /desc/i, /lan[cç]amento/i, /title/i]);
@@ -1477,6 +1503,10 @@
     // extrato de conta corrente. Detectamos pelo nome literal das colunas e invertemos.
     var isCardInvoiceFormat = (dateCol.toLowerCase()==='date' && descCol.toLowerCase()==='title' && amtCol.toLowerCase()==='amount');
     csvIsCardInvoice = isCardInvoiceFormat;
+
+    // Mês da própria fatura (não da compra) — só faz sentido pra fatura de cartão, e só
+    // quando o nome do arquivo tem uma data reconhecível (ex: "Nubank_20260905.csv").
+    var invoiceMonth = isCardInvoiceFormat ? parseInvoiceMonthFromFilename(fileName) : null;
 
     var accountId = document.getElementById('csv-account').value;
 
@@ -1495,7 +1525,8 @@
         duplicate: !!dup,
         include: !isNaN(amt) && !!isoDate && !dup,
         installmentTag: instTag,
-        projectFuture: !!(instTag && instTag.current < instTag.total)
+        projectFuture: !!(instTag && instTag.current < instTag.total),
+        invoiceMonth: invoiceMonth
       };
     }).filter(function(r){ return r.description; });
 
@@ -1630,7 +1661,8 @@
       state.transactions.push({
         id: uid(), accountId: accountId, date: r.date, description: r.description,
         category: r.category, amount: r.amount,
-        installment: tag ? { group: groupId, current: tag.current, total: tag.total } : null
+        installment: tag ? { group: groupId, current: tag.current, total: tag.total } : null,
+        invoiceMonth: r.invoiceMonth || undefined
       });
       added++;
 
@@ -1645,7 +1677,8 @@
           state.transactions.push({
             id: uid(), accountId: accountId, date: isoFuture, description: futureDesc,
             category: r.category, amount: r.amount,
-            installment: { group: groupId, current: n, total: tag.total }
+            installment: { group: groupId, current: n, total: tag.total },
+            invoiceMonth: r.invoiceMonth ? addMonthsToYYYYMM(r.invoiceMonth, n - tag.current) : undefined
           });
           projected++;
         }
@@ -1698,7 +1731,7 @@
   function monthTransactions(){
     var mk = monthKey(viewDate);
     return filteredTransactions().filter(function(t){
-      return t.date && t.date.slice(0,7)===mk;
+      return txMonthKey(t)===mk;
     });
   }
 
@@ -2537,7 +2570,7 @@
       var d = new Date(viewDate.getFullYear(), viewDate.getMonth()-i, 1);
       var mk = monthKey(d);
       labels.push(months[d.getMonth()]);
-      var txs = filteredTransactions().filter(function(t){ return t.date.slice(0,7)===mk; });
+      var txs = filteredTransactions().filter(function(t){ return txMonthKey(t)===mk; });
       incomeData.push(txs.filter(function(t){return t.amount>0;}).reduce(function(s,t){return s+t.amount;},0));
       expenseData.push(txs.filter(function(t){return t.amount<0;}).reduce(function(s,t){return s+Math.abs(t.amount);},0));
     }
