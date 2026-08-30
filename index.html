@@ -630,6 +630,7 @@
   var CATEGORIES = [
     {id:'salario', name:'Salário', color:'#39ff8a', kind:'income'},
     {id:'outras_receitas', name:'Outras receitas', color:'#7dffb3', kind:'income'},
+    {id:'pagamento_fatura', name:'Pagamento de fatura', color:'#5a6b8c', kind:'income'},
     {id:'alimentacao', name:'Alimentação', color:'#ffe066', kind:'expense'},
     {id:'transporte', name:'Transporte', color:'#ff9d4d', kind:'expense'},
     {id:'moradia', name:'Moradia', color:'#9b6bff', kind:'expense'},
@@ -725,16 +726,19 @@
     return y + '-' + String(mo).padStart(2,'0');
   }
 
-  // "Despesas do mês" precisa bater com o valor fechado da fatura real. Dentro do
-  // ciclo de uma fatura, além dos "Pagamento recebido" que quitam a fatura anterior
-  // (não afetam a fatura atual), pode haver: (a) adiantamentos que o usuário fez no
-  // meio do ciclo por conta própria, e (b) descontos automáticos do banco (ex:
-  // "Desconto Antecipação ..."). Ambos reduzem o valor que ainda falta pagar da
-  // fatura atual e não são renda de verdade — precisam ser excluídos da receita e
-  // abatidos da despesa. Identificamos isso encontrando, entre os lançamentos de
-  // crédito (valor positivo, categoria de renda) de cada invoiceMonth, o subconjunto
-  // que soma o valor exato da despesa líquida do mês anterior (a quitação real) —
-  // o restante são adiantamentos/descontos do ciclo atual.
+  // "Despesas do mês" precisa bater com o valor fechado da fatura real, e "Receita
+  // do mês" não pode contar pagamento de fatura como se fosse renda. Dentro do
+  // ciclo de uma fatura (categoria 'pagamento_fatura', atribuída na importação a
+  // qualquer "Pagamento recebido" de fatura de cartão — ver handleCsvParsed), tem
+  // sempre a quitação da fatura ANTERIOR (não é renda, e não afeta a despesa da
+  // fatura ATUAL, que já foi contabilizada no mês passado), e pode também ter:
+  // (a) adiantamentos que o usuário fez no meio do ciclo por conta própria, e (b)
+  // descontos automáticos do banco (ex: "Desconto Antecipação ..."). Esses dois
+  // últimos reduzem o valor que ainda falta pagar da fatura atual, então abatem a
+  // despesa do mês, além de nunca contarem como receita. Identificamos a quitação
+  // encontrando, entre os créditos de cada invoiceMonth, o subconjunto que soma o
+  // valor exato da despesa líquida do mês anterior — o restante são
+  // adiantamentos/descontos do ciclo atual.
   function computeInvoiceMonthAdjustments(){
     var byMonth = {};
     state.transactions.forEach(function(t){
@@ -745,12 +749,18 @@
     var months = Object.keys(byMonth).sort();
     var netByMonth = {};
     var reducerIds = {};
+    var nonIncomeIds = {};
     months.forEach(function(mk){
       var txs = byMonth[mk];
       var rawExpense = txs.filter(function(t){ return t.amount<0; })
         .reduce(function(s,t){ return s+Math.abs(t.amount); }, 0);
+      txs.forEach(function(t){
+        // Pagamento de fatura nunca é receita — nem a quitação da fatura anterior
+        // nem um adiantamento da fatura atual.
+        if(t.amount>0 && t.category==='pagamento_fatura') nonIncomeIds[t.id] = true;
+      });
       var candidates = txs.filter(function(t){
-        return t.amount>0 && (t.category==='salario' || t.category==='outras_receitas');
+        return t.amount>0 && (t.category==='pagamento_fatura' || t.category==='outras_receitas');
       });
       var prevKey = addMonthsToYYYYMM(mk, -1);
       var prevNet = netByMonth.hasOwnProperty(prevKey) ? netByMonth[prevKey] : null;
@@ -771,7 +781,7 @@
       var reducerSum = reducers.reduce(function(s,t){ return s+t.amount; }, 0);
       netByMonth[mk] = round2(rawExpense - reducerSum);
     });
-    return { netByMonth: netByMonth, reducerIds: reducerIds };
+    return { netByMonth: netByMonth, reducerIds: reducerIds, nonIncomeIds: nonIncomeIds };
   }
 
   function ghConfig(){
@@ -1570,9 +1580,15 @@
       var isoDate = normalizeDate(dateVal);
       var dup = !isNaN(amt) && !!isoDate ? findDuplicate(accountId, isoDate, desc, amt) : null;
       var instTag = parseInstallmentTag(desc);
+      // Numa fatura de cartão, "Pagamento recebido" nunca é renda de verdade — é o
+      // próprio usuário quitando (ou adiantando) a fatura. Categorizamos à parte
+      // pra nunca entrar como Receita do mês, mesmo que quite a fatura anterior.
+      var category = (isCardInvoiceFormat && /pagamento\s+recebido/i.test(desc))
+        ? 'pagamento_fatura'
+        : autoCategorize(desc, kind);
       return {
         date: isoDate, description: desc, amount: amt, kind: kind,
-        category: autoCategorize(desc, kind),
+        category: category,
         duplicate: !!dup,
         include: !isNaN(amt) && !!isoDate && !dup,
         installmentTag: instTag,
@@ -2456,7 +2472,7 @@
 
     var txs = monthTransactions();
     var invoiceAdj = computeInvoiceMonthAdjustments();
-    var income = txs.filter(function(t){return t.amount>0 && !invoiceAdj.reducerIds[t.id];}).reduce(function(s,t){return s+t.amount;},0);
+    var income = txs.filter(function(t){return t.amount>0 && !invoiceAdj.reducerIds[t.id] && !invoiceAdj.nonIncomeIds[t.id];}).reduce(function(s,t){return s+t.amount;},0);
     var expenseRaw = txs.filter(function(t){return t.amount<0;}).reduce(function(s,t){return s+Math.abs(t.amount);},0);
     var expenseReducers = txs.filter(function(t){return invoiceAdj.reducerIds[t.id];}).reduce(function(s,t){return s+t.amount;},0);
     var expense = round2(expenseRaw - expenseReducers);
@@ -2633,7 +2649,7 @@
       var mk = monthKey(d);
       labels.push(months[d.getMonth()]);
       var txs = filteredTransactions().filter(function(t){ return txMonthKey(t)===mk; });
-      incomeData.push(txs.filter(function(t){return t.amount>0 && !invoiceAdj.reducerIds[t.id];}).reduce(function(s,t){return s+t.amount;},0));
+      incomeData.push(txs.filter(function(t){return t.amount>0 && !invoiceAdj.reducerIds[t.id] && !invoiceAdj.nonIncomeIds[t.id];}).reduce(function(s,t){return s+t.amount;},0));
       var expRaw = txs.filter(function(t){return t.amount<0;}).reduce(function(s,t){return s+Math.abs(t.amount);},0);
       var expReducers = txs.filter(function(t){return invoiceAdj.reducerIds[t.id];}).reduce(function(s,t){return s+t.amount;},0);
       expenseData.push(round2(expRaw - expReducers));
