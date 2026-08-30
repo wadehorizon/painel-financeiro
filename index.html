@@ -723,6 +723,55 @@
     return y + '-' + String(mo).padStart(2,'0');
   }
 
+  // "Despesas do mês" precisa bater com o valor fechado da fatura real. Dentro do
+  // ciclo de uma fatura, além dos "Pagamento recebido" que quitam a fatura anterior
+  // (não afetam a fatura atual), pode haver: (a) adiantamentos que o usuário fez no
+  // meio do ciclo por conta própria, e (b) descontos automáticos do banco (ex:
+  // "Desconto Antecipação ..."). Ambos reduzem o valor que ainda falta pagar da
+  // fatura atual e não são renda de verdade — precisam ser excluídos da receita e
+  // abatidos da despesa. Identificamos isso encontrando, entre os lançamentos de
+  // crédito (valor positivo, categoria de renda) de cada invoiceMonth, o subconjunto
+  // que soma o valor exato da despesa líquida do mês anterior (a quitação real) —
+  // o restante são adiantamentos/descontos do ciclo atual.
+  function computeInvoiceMonthAdjustments(){
+    var byMonth = {};
+    state.transactions.forEach(function(t){
+      var mk = txMonthKey(t);
+      if(!mk) return;
+      (byMonth[mk] = byMonth[mk] || []).push(t);
+    });
+    var months = Object.keys(byMonth).sort();
+    var netByMonth = {};
+    var reducerIds = {};
+    months.forEach(function(mk){
+      var txs = byMonth[mk];
+      var rawExpense = txs.filter(function(t){ return t.amount<0; })
+        .reduce(function(s,t){ return s+Math.abs(t.amount); }, 0);
+      var candidates = txs.filter(function(t){
+        return t.amount>0 && (t.category==='salario' || t.category==='outras_receitas');
+      });
+      var prevKey = addMonthsToYYYYMM(mk, -1);
+      var prevNet = netByMonth.hasOwnProperty(prevKey) ? netByMonth[prevKey] : null;
+      var reducers = [];
+      if(prevNet !== null && candidates.length > 1){
+        var n = candidates.length, best = null, bestDiff = Infinity;
+        for(var mask=0; mask<(1<<n); mask++){
+          var sum = 0;
+          for(var i=0;i<n;i++){ if(mask & (1<<i)) sum += candidates[i].amount; }
+          var diff = Math.abs(sum - prevNet);
+          if(diff < bestDiff){ bestDiff = diff; best = mask; }
+        }
+        if(bestDiff <= 0.05){
+          for(var i=0;i<n;i++){ if(!(best & (1<<i))) reducers.push(candidates[i]); }
+        }
+      }
+      reducers.forEach(function(t){ reducerIds[t.id] = true; });
+      var reducerSum = reducers.reduce(function(s,t){ return s+t.amount; }, 0);
+      netByMonth[mk] = round2(rawExpense - reducerSum);
+    });
+    return { netByMonth: netByMonth, reducerIds: reducerIds };
+  }
+
   function ghConfig(){
     try{ return JSON.parse(localStorage.getItem('financas-gh-config') || 'null'); }
     catch(e){ return null; }
@@ -1554,19 +1603,26 @@
     var normDesc = normalizeDesc(tagNew ? tagNew.base : description);
     return state.transactions.find(function(t){
       if(t.accountId !== accountId) return false;
-      if(Math.abs(Math.abs(t.amount) - Math.abs(amount)) > 0.01) return false;
       var tagExisting = parseInstallmentTag(t.description);
       var tDesc = normalizeDesc(tagExisting ? tagExisting.base : t.description);
       if(tDesc !== normDesc) return false;
       if(tagNew && tagExisting){
-        // Parcelas: identificadas pela posição (current/total), não pela data exata.
-        // A data real de cobrança de uma parcela costuma variar alguns dias de mês
-        // pra mês (fechamento de fatura, fim de semana, etc.), então exigir data
-        // idêntica fazia o app não reconhecer a parcela real importada depois como
-        // a mesma parcela já projetada automaticamente — e duplicava tudo em cascata.
+        // Parcelas: identificadas pela posição (current/total) e descrição base.
+        // Usamos uma tolerância de valor um pouco mais larga (10 centavos) em vez
+        // de exigir o valor quase idêntico: o valor de uma parcela real pode
+        // variar poucos centavos de mês pra mês (juros, câmbio, arredondamento do
+        // banco), e uma tolerância de 0.01 sofria com imprecisão de ponto
+        // flutuante e não reconhecia a mesma parcela real importada depois,
+        // duplicando o lançamento em cascata. Ao mesmo tempo, a tolerância não
+        // pode ser larga demais a ponto de confundir duas compras parceladas
+        // diferentes que, por coincidência, cheguem à mesma posição (N/M) — por
+        // isso ainda comparamos o valor, com uma margem pequena.
+        if(Math.abs(Math.abs(t.amount) - Math.abs(amount)) > 0.10) return false;
         return tagNew.current === tagExisting.current && tagNew.total === tagExisting.total;
       }
-      // Lançamentos sem parcela: continuam exigindo a mesma data pra contar como duplicado.
+      // Lançamentos sem parcela: continuam exigindo mesma data E valor (com
+      // pequena tolerância) pra contar como duplicado.
+      if(Math.abs(Math.abs(t.amount) - Math.abs(amount)) > 0.01) return false;
       return t.date === date;
     }) || null;
   }
@@ -2397,8 +2453,11 @@
     document.getElementById('month-label').textContent = months[viewDate.getMonth()] + ' de ' + viewDate.getFullYear();
 
     var txs = monthTransactions();
-    var income = txs.filter(function(t){return t.amount>0;}).reduce(function(s,t){return s+t.amount;},0);
-    var expense = txs.filter(function(t){return t.amount<0;}).reduce(function(s,t){return s+Math.abs(t.amount);},0);
+    var invoiceAdj = computeInvoiceMonthAdjustments();
+    var income = txs.filter(function(t){return t.amount>0 && !invoiceAdj.reducerIds[t.id];}).reduce(function(s,t){return s+t.amount;},0);
+    var expenseRaw = txs.filter(function(t){return t.amount<0;}).reduce(function(s,t){return s+Math.abs(t.amount);},0);
+    var expenseReducers = txs.filter(function(t){return invoiceAdj.reducerIds[t.id];}).reduce(function(s,t){return s+t.amount;},0);
+    var expense = round2(expenseRaw - expenseReducers);
     document.getElementById('stat-income').textContent = fmtMoney(income);
     document.getElementById('stat-expense').textContent = fmtMoney(expense);
     document.getElementById('stat-balance').textContent = fmtMoney(income-expense);
@@ -2566,13 +2625,16 @@
     var incomeData = [];
     var expenseData = [];
     var months = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
+    var invoiceAdj = computeInvoiceMonthAdjustments();
     for(var i=5;i>=0;i--){
       var d = new Date(viewDate.getFullYear(), viewDate.getMonth()-i, 1);
       var mk = monthKey(d);
       labels.push(months[d.getMonth()]);
       var txs = filteredTransactions().filter(function(t){ return txMonthKey(t)===mk; });
-      incomeData.push(txs.filter(function(t){return t.amount>0;}).reduce(function(s,t){return s+t.amount;},0));
-      expenseData.push(txs.filter(function(t){return t.amount<0;}).reduce(function(s,t){return s+Math.abs(t.amount);},0));
+      incomeData.push(txs.filter(function(t){return t.amount>0 && !invoiceAdj.reducerIds[t.id];}).reduce(function(s,t){return s+t.amount;},0));
+      var expRaw = txs.filter(function(t){return t.amount<0;}).reduce(function(s,t){return s+Math.abs(t.amount);},0);
+      var expReducers = txs.filter(function(t){return invoiceAdj.reducerIds[t.id];}).reduce(function(s,t){return s+t.amount;},0);
+      expenseData.push(round2(expRaw - expReducers));
     }
     if(lineChart) lineChart.destroy();
     lineChart = new Chart(ctx, {
