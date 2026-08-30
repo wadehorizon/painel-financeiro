@@ -700,9 +700,11 @@
   // Fatura de cartão fecha num ciclo que atravessa dois meses civis (ex: fatura que
   // fecha 05/09 cobre compras de ~29/07 a 26/08) — agrupar lançamentos importados de
   // fatura pela data da compra faz "Despesas do mês" nunca bater com o valor real da
-  // fatura. Por isso, ao importar um CSV de fatura, guardamos em invoiceMonth o mês da
-  // própria fatura (extraído do nome do arquivo, ex: "Nubank_20260905.csv" -> "2026-09"),
-  // e usamos esse campo pra agrupar em vez da data, quando ele existir.
+  // fatura. Por isso, ao importar um CSV de fatura, guardamos em invoiceMonth o mês
+  // que a fatura REPRESENTA (o mês do grosso das compras, não o mês em que ela
+  // fecha/vence) — ex: "Nubank_20260905.csv" fecha/vence em setembro mas cobre
+  // majoritariamente compras de agosto, então vira invoiceMonth "2026-08" — e
+  // usamos esse campo pra agrupar em vez da data, quando ele existir.
   function txMonthKey(t){
     return t.invoiceMonth || (t.date ? t.date.slice(0,7) : '');
   }
@@ -712,7 +714,7 @@
     if(!m) return null;
     var mo = parseInt(m[2],10), da = parseInt(m[3],10);
     if(mo<1||mo>12||da<1||da>31) return null;
-    return m[1] + '-' + m[2];
+    return addMonthsToYYYYMM(m[1] + '-' + m[2], -1);
   }
   function addMonthsToYYYYMM(ym, months){
     var parts = ym.split('-');
