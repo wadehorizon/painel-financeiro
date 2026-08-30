@@ -706,8 +706,23 @@
   // fecha/vence) — ex: "Nubank_20260905.csv" fecha/vence em setembro mas cobre
   // majoritariamente compras de agosto, então vira invoiceMonth "2026-08" — e
   // usamos esse campo pra agrupar em vez da data, quando ele existir.
+  // Lançamentos manuais (ex: salário recebido no início do mês seguinte, pra pagar
+  // as contas do mês anterior) também podem "pertencer" a um mês diferente da data
+  // em que caem — igual à fatura de cartão. Convencionamos marcar isso escrevendo o
+  // mês de referência na própria descrição, ex: "Salário (jan/26)" — e reconhecemos
+  // esse padrão automaticamente pra agrupar pelo mês certo, sem precisar de invoiceMonth.
+  var MONTH_ABBR_PT = {jan:1,fev:2,mar:3,abr:4,mai:5,jun:6,jul:7,ago:8,set:9,out:10,nov:11,dez:12};
+  function parseMonthRefFromDescription(desc){
+    if(!desc) return null;
+    var m = String(desc).match(/\((jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)\/(\d{2,4})\)\s*$/i);
+    if(!m) return null;
+    var mo = MONTH_ABBR_PT[m[1].toLowerCase()];
+    var yr = parseInt(m[2],10);
+    if(yr < 100) yr += 2000;
+    return yr + '-' + (mo<10?'0'+mo:''+mo);
+  }
   function txMonthKey(t){
-    return t.invoiceMonth || (t.date ? t.date.slice(0,7) : '');
+    return t.invoiceMonth || parseMonthRefFromDescription(t.description) || (t.date ? t.date.slice(0,7) : '');
   }
   function parseInvoiceMonthFromFilename(name){
     if(!name) return null;
@@ -1431,6 +1446,7 @@
     }
     var signedAmount = currentTxType==='income' ? Math.abs(amountRaw) : -Math.abs(amountRaw);
     var baseDate = new Date(date+'T12:00:00');
+    var monthRef = parseMonthRefFromDescription(desc);
 
     if(installments > 1){
       var groupId = uid();
@@ -1441,13 +1457,15 @@
           id: uid(), accountId: accountId, date: d.toISOString().slice(0,10),
           description: desc + ' (' + (i+1) + '/' + installments + ')',
           category: category, amount: perInstallment,
-          installment: { group: groupId, current: i+1, total: installments }
+          installment: { group: groupId, current: i+1, total: installments },
+          invoiceMonth: monthRef || null
         });
       }
     }else{
       state.transactions.push({
         id: uid(), accountId: accountId, date: date, description: desc,
-        category: category, amount: signedAmount, installment: null
+        category: category, amount: signedAmount, installment: null,
+        invoiceMonth: monthRef || null
       });
     }
     persist();
