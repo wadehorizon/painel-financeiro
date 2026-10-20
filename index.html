@@ -251,8 +251,7 @@
 
   .salary-forecast-box{background:var(--surface-2);border-radius:8px;padding:12px 14px;margin-bottom:16px;}
   .salary-forecast-box .label{font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:0.08em;color:var(--text-muted);text-transform:uppercase;margin-bottom:8px;}
-  .salary-forecast-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
-  .salary-forecast-row input{width:140px;}
+  .salary-forecast-value{font-family:'Fraunces',serif;font-style:italic;font-weight:500;font-size:20px;color:var(--gold);}
   .salary-forecast-box .hint{font-size:11px;color:var(--text-muted);margin-top:8px;line-height:1.5;}
   .forecast-tag{
     display:inline-block;margin-top:4px;font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:0.08em;
@@ -428,14 +427,10 @@
   <div class="panel">
     <h2>Salário</h2>
     <div class="salary-overview" id="salary-overview"></div>
-    <div class="salary-forecast-box">
-      <div class="label">Previsão de salário p/ meses sem holerite ainda</div>
-      <div class="salary-forecast-row">
-        <input type="text" inputmode="decimal" id="salary-forecast-input" placeholder="0,00">
-        <button class="btn" id="salary-forecast-save">Salvar previsão</button>
-        <button class="btn" id="salary-forecast-clear" style="display:none;">Remover</button>
-      </div>
-      <div class="hint">Esse valor aparece como receita prevista nos meses atual/futuros que ainda não têm holerite ou salário lançado. Assim que você inserir o holerite real daquele mês, ele substitui a previsão automaticamente.</div>
+    <div class="salary-forecast-box" id="salary-forecast-box" style="display:none;">
+      <div class="label">Previsão automática de salário</div>
+      <div class="salary-forecast-value" id="salary-forecast-value"></div>
+      <div class="hint">Calculada automaticamente com base no seu último holerite. Esse valor aparece como receita prevista nos meses atual/futuros que ainda não têm holerite ou salário lançado. Assim que você inserir o holerite real daquele mês, ele substitui a previsão automaticamente.</div>
     </div>
     <div class="payslip-list" id="payslip-list"></div>
     <div class="empty-msg" id="payslip-empty" style="display:none;">Nenhum holerite cadastrado ainda. Adicione um para eu acompanhar seu salário mês a mês.</div>
@@ -671,7 +666,7 @@
     [/salario|pagamento recebido|pix recebido|deposito/i,'salario']
   ];
 
-  var state = { accounts: [], transactions: [], payslips: [], salaryForecastAmount: null };
+  var state = { accounts: [], transactions: [], payslips: [] };
   var selectedAccountId = 'all';
   var editingAccountId = null;
   var viewDate = new Date();
@@ -744,11 +739,10 @@
     return t.invoiceMonth || parseMonthRefFromDescription(t.description) || (t.date ? t.date.slice(0,7) : '');
   }
 
-  // Previsão de salário: um valor único que o usuário define pra "chutar" a receita
-  // de meses atuais/futuros que ainda não têm holerite nem lançamento de salário real.
-  // Some ao restante da receita do mês (ex: outras receitas eventuais) só quando não
-  // existe holerite nem lançamento de categoria 'salario' pra aquele mês — assim que
-  // um dos dois existir, a previsão para de ser aplicada automaticamente pra esse mês.
+  // Previsão de salário: calculada automaticamente a partir do último holerite
+  // cadastrado, aplicada à receita de meses atuais/futuros que ainda não têm
+  // holerite nem lançamento de salário real. Assim que um dos dois existir pra
+  // um mês, a previsão para de ser aplicada automaticamente pra esse mês.
   function todayMonthKey(){ return monthKey(new Date()); }
   function hasRealSalaryForMonth(mk){
     if((state.payslips||[]).some(function(p){ return p.month===mk; })) return true;
@@ -756,12 +750,16 @@
       return t.amount>0 && t.category==='salario' && txMonthKey(t)===mk;
     });
   }
+  function lastPayslip(){
+    var list = sortedPayslips();
+    return list.length ? list[0] : null;
+  }
   function salaryForecastForMonth(mk){
-    var forecast = state.salaryForecastAmount;
-    if(forecast==null || !(forecast>0)) return null;
     if(mk < todayMonthKey()) return null;
     if(hasRealSalaryForMonth(mk)) return null;
-    return forecast;
+    var last = lastPayslip();
+    if(!last || !(last.net>0)) return null;
+    return last.net;
   }
   function parseInvoiceMonthFromFilename(name){
     if(!name) return null;
@@ -914,7 +912,7 @@
     }
     if(res.status === 404){
       currentSha = null;
-      return { accounts: [], transactions: [], payslips: [], salaryForecastAmount: null };
+      return { accounts: [], transactions: [], payslips: [] };
     }
     if(res.status === 401 || res.status === 403){
       throw { type: 'auth', status: res.status };
@@ -1246,8 +1244,7 @@
       state = {
         accounts: parsed.accounts || [],
         transactions: parsed.transactions || [],
-        payslips: parsed.payslips || [],
-        salaryForecastAmount: parsed.salaryForecastAmount != null ? parsed.salaryForecastAmount : null
+        payslips: parsed.payslips || []
       };
       persist();
       selectedAccountId = 'all';
@@ -2460,31 +2457,17 @@
   }
 
   function renderSalaryForecastBox(){
-    var input = document.getElementById('salary-forecast-input');
-    var clearBtn = document.getElementById('salary-forecast-clear');
-    if(!input) return;
-    if(document.activeElement !== input){
-      input.value = state.salaryForecastAmount!=null ? state.salaryForecastAmount.toFixed(2).replace('.',',') : '';
-    }
-    clearBtn.style.display = state.salaryForecastAmount!=null ? 'inline-block' : 'none';
-  }
-
-  document.getElementById('salary-forecast-save').addEventListener('click', function(){
-    var val = parseMoneyInput(document.getElementById('salary-forecast-input').value);
-    if(isNaN(val) || val<=0){
-      alert('Digite um valor de previsão maior que zero (ou use "Remover" para apagar a previsão).');
+    var box = document.getElementById('salary-forecast-box');
+    var valueEl = document.getElementById('salary-forecast-value');
+    if(!box) return;
+    var last = lastPayslip();
+    if(!last || !(last.net>0)){
+      box.style.display = 'none';
       return;
     }
-    state.salaryForecastAmount = round2(val);
-    persist();
-    render();
-  });
-
-  document.getElementById('salary-forecast-clear').addEventListener('click', function(){
-    state.salaryForecastAmount = null;
-    persist();
-    render();
-  });
+    box.style.display = 'block';
+    valueEl.textContent = fmtMoney(last.net) + ' (baseado em ' + monthLabelShort(last.month) + ')';
+  }
 
   function renderPayslipList(){
     var listEl = document.getElementById('payslip-list');
